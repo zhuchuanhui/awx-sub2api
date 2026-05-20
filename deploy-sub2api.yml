@@ -1,10 +1,30 @@
 ---
 - name: Deploy sub2api to Oracle Linux hosts
   hosts: sub2api_targets
-  gather_facts: true
+  gather_facts: false
   become: true
+  vars:
+    ansible_host_key_checking: false
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
   pre_tasks:
+    - name: Check if python3.11 is installed
+      ansible.builtin.raw: which python3.11
+      register: _python311_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install python3.11 if missing
+      ansible.builtin.raw: dnf install -y python3.11
+      when: _python311_check.rc != 0
+
+    - name: Set python3.11 as interpreter
+      ansible.builtin.set_fact:
+        ansible_python_interpreter: /usr/bin/python3.11
+
+    - name: Gather facts manually with python3.11
+      ansible.builtin.setup:
+
     - name: Validate supported OS family
       ansible.builtin.assert:
         that:

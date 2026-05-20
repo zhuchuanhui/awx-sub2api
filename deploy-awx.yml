@@ -16,3 +16,104 @@
 
   roles:
     - role: awx_k8s
+
+# AWX 構築完了後にリソース（Project/Credential/Inventory/Job Template）を自動セットアップ。
+# 変数:
+#   awx_ssh_private_key_file : SSH 秘密鍵ファイルパス（既定: group_vars/all.yml → ~/.ssh/id_rsa）
+#   awx_setup_resources      : false を渡すとこのプレイをスキップ（デフォルト: true）
+- name: AWX リソース自動セットアップ
+  hosts: awx_controller
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: AWX リソースセットアップをスキップするか確認
+      ansible.builtin.meta: end_play
+      when: not (awx_setup_resources | default(true) | bool)
+
+    - name: awx_ssh_private_key_file を自動設定（Ansible 実行マシン上の鍵を検出）
+      ansible.builtin.set_fact:
+        awx_ssh_private_key_file: "{{ item }}"
+      loop: "{{ _awx_ssh_key_candidates }}"
+      when:
+        - awx_ssh_private_key_file is not defined or awx_ssh_private_key_file | length == 0
+        - item | length > 0
+        - item | expanduser is file
+      vars:
+        _awx_ssh_key_candidates: >-
+          {{
+            [
+              awx_ssh_private_key_file | default(''),
+              ansible_ssh_private_key_file | default(''),
+              (lookup('env', 'HOME') ~ '/.ssh/id_rsa'),
+              (lookup('env', 'HOME') ~ '/.ssh/id_ed25519')
+            ] | select('ne', '') | unique | list
+          }}
+
+    - name: awx_ssh_private_key_file が指定されているか確認
+      ansible.builtin.assert:
+        that:
+          - awx_ssh_private_key_file is defined
+          - awx_ssh_private_key_file | length > 0
+        fail_msg: |
+          AWX リソースセットアップには opc 用 SSH 秘密鍵が必要です。
+          見つからなかった場合は明示指定してください:
+            ansible-playbook deploy-awx.yml -e awx_ssh_private_key_file=~/.ssh/id_rsa
+          スキップする場合: -e awx_setup_resources=false
+
+    - name: AWX admin パスワードを Kubernetes シークレットから取得
+      ansible.builtin.command: >
+        kubectl -n awx get secret awx-admin-password
+        -o jsonpath={.data.password}
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: _awx_pw_b64
+      changed_when: false
+      become: true
+      vars:
+        ansible_become: true
+
+    - name: AWX リソースセットアップスクリプトをリモートへ転送
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/setup-awx-resources.py"
+        dest: "/home/{{ ansible_user }}/setup-awx-resources.py"
+        mode: "0755"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      become: false
+      vars:
+        ansible_become: false
+
+    - name: SSH 秘密鍵をリモートに一時配置
+      ansible.builtin.copy:
+        content: "{{ lookup('file', awx_ssh_private_key_file | expanduser) }}"
+        dest: "/home/{{ ansible_user }}/.awx_setup_key"
+        mode: "0600"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      become: false
+      no_log: true
+      vars:
+        ansible_become: false
+
+    - name: AWX リソースをセットアップ（setup-awx-resources.py 実行）
+      ansible.builtin.command: >
+        python3 /home/{{ ansible_user }}/setup-awx-resources.py
+        /home/{{ ansible_user }}/.awx_setup_key
+        {{ _awx_pw_b64.stdout | b64decode }}
+      become: false
+      vars:
+        ansible_become: false
+      register: _awx_setup_result
+
+    - name: AWX セットアップ結果を表示
+      ansible.builtin.debug:
+        msg: "{{ _awx_setup_result.stdout_lines }}"
+
+    - name: 一時ファイルを削除
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/home/{{ ansible_user }}/.awx_setup_key"
+        - "/home/{{ ansible_user }}/setup-awx-resources.py"

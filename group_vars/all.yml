@@ -16,6 +16,10 @@ sub2api_env:
 # AWX ではここを Inventory / Group / Host vars や Survey で上書きしてください。
 sub2api_env_overrides: {}
 
+# AWX ジョブランナーはプロジェクトの ansible.cfg を読まないため inventory 変数でも指定する
+ansible_host_key_checking: false
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
 awx_k8s_work_dir: /home/opc/awx-sub2api
 awx_k8s_subdir: k8s/awx
 awx_admin_user: admin
@@ -32,3 +36,6 @@ awx_firewall_ports:
   - 10259/tcp
   - 10257/tcp
   - 30080/tcp
+
+# AWX Machine Credential 登録用（Ansible 実行マシン上のパス。上書き: -e awx_ssh_private_key_file=...）
+awx_ssh_private_key_file: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"

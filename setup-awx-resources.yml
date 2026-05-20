@@ -1,0 +1,481 @@
+---
+# AWX リソース初期セットアップ Playbook
+# 実行例:
+#   ansible-playbook setup-awx-resources.yml \
+#     -e awx_password='<AWX_ADMIN_PASSWORD>' \
+#     -e awx_ssh_private_key_file=~/.ssh/id_rsa
+#
+# 必須変数:
+#   awx_password          : AWX admin パスワード
+#   awx_ssh_private_key_file : opc の SSH 秘密鍵ファイルパス
+#
+# オプション変数 (デフォルト値あり):
+#   awx_host              : AWX の URL (デフォルト: http://140.83.58.183:30080)
+#   awx_username          : AWX ユーザー名 (デフォルト: admin)
+#   awx_org               : AWX 組織名 (デフォルト: Default)
+#   awx_scm_url           : リポジトリ URL (デフォルト: https://github.com/zhuchuanhui/awx-sub2api.git)
+#   awx_scm_branch        : ブランチ (デフォルト: main)
+
+- name: AWX リソース初期セットアップ
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    awx_host: "http://140.83.58.183:30080"
+    awx_username: "admin"
+    awx_org: "Default"
+    awx_scm_url: "https://github.com/zhuchuanhui/awx-sub2api.git"
+    awx_scm_branch: "main"
+    awx_project_name: "awx-sub2api"
+    awx_credential_name: "opc-machine-credential"
+    awx_inventory_name: "sub2api-inventory"
+    awx_api: "{{ awx_host }}/api/v2"
+    awx_ssh_host_key_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    awx_proxy_ssh_args: "{{ awx_ssh_host_key_opts }} -o ProxyJump=opc@140.83.58.183"
+    awx_inventory_variables: |
+      ansible_user: opc
+      ansible_become: true
+      ansible_host_key_checking: false
+      ansible_ssh_common_args: "{{ awx_ssh_host_key_opts }}"
+      # ansible.cfg の interpreter_python は AWX ランナーでは読まれないため明示指定。
+      # auto_legacy_silent は Python 3.6 ホストで /usr/bin/python3 を優先選択し警告を抑制する。
+      ansible_python_interpreter: auto_legacy_silent
+      sub2api_deploy_dir: /home/opc/sub2api-deploy
+      sub2api_compose_project_name: sub2api-deploy
+
+    # Inventory に登録するホスト・グループ定義
+    awx_inventory_groups:
+      - name: awx_controller
+        hosts:
+          - name: instance-20251213-ARM_fw
+            vars:
+              ansible_host: "140.83.58.183"
+      - name: sub2api_targets
+        hosts:
+          - name: amd-instance-internal1
+            vars:
+              ansible_host: "10.0.1.100"
+              ansible_ssh_common_args: "{{ awx_proxy_ssh_args }}"
+          - name: amd-instance-internal2
+            vars:
+              ansible_host: "10.0.2.100"
+              ansible_ssh_common_args: "{{ awx_proxy_ssh_args }}"
+          - name: arm-instance
+            vars:
+              ansible_host: "140.83.81.132"
+          - name: amd-instance-1
+            vars:
+              ansible_host: "152.70.84.253"
+          - name: amd-instance-2
+            vars:
+              ansible_host: "141.147.149.131"
+
+    # Job Template 定義
+    awx_job_templates:
+      - name: build-awx-controller
+        playbook: deploy-awx.yml
+        inventory: "{{ awx_inventory_name }}"
+        limit: awx_controller
+        description: "AWX コントローラーサーバーを Kubernetes 上に構築する"
+      - name: deploy-sub2api
+        playbook: deploy-sub2api.yml
+        inventory: "{{ awx_inventory_name }}"
+        limit: sub2api_targets
+        description: "sub2api を対象ホストに配布・起動する"
+
+  tasks:
+    # ─────────────────────────────────────────
+    # 0. 事前確認
+    # ─────────────────────────────────────────
+    - name: 必須変数チェック
+      ansible.builtin.assert:
+        that:
+          - awx_password is defined and awx_password | length > 0
+          - awx_ssh_private_key_content is defined and awx_ssh_private_key_content | length > 0
+        fail_msg: |
+          以下の変数が必要です:
+            -e awx_password=<パスワード>
+            -e awx_ssh_private_key_content=<SSH秘密鍵の内容>
+          setup-awx-resources.sh スクリプトから実行してください。
+
+    - name: AWX 接続確認
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/ping/"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        status_code: 200
+        validate_certs: false
+      register: _awx_ping
+      failed_when: _awx_ping.status != 200
+
+    - name: 接続確認 OK
+      ansible.builtin.debug:
+        msg: "AWX {{ awx_host }} に接続できました (version: {{ _awx_ping.json.version }})"
+
+    # ─────────────────────────────────────────
+    # 1. Organization ID 取得
+    # ─────────────────────────────────────────
+    - name: Organization ID 取得
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/organizations/?name={{ awx_org | urlencode }}"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: _org
+
+    - name: Organization ID をセット
+      ansible.builtin.set_fact:
+        _org_id: "{{ _org.json.results[0].id }}"
+
+    # ─────────────────────────────────────────
+    # 2. Project 作成（存在確認 → 作成 or スキップ）
+    # ─────────────────────────────────────────
+    - name: Project 存在確認
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/projects/?name={{ awx_project_name | urlencode }}"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: _project_check
+
+    - name: Project 作成
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/projects/"
+        method: POST
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          name: "{{ awx_project_name }}"
+          organization: "{{ _org_id }}"
+          scm_type: git
+          scm_url: "{{ awx_scm_url }}"
+          scm_branch: "{{ awx_scm_branch }}"
+          scm_update_on_launch: true
+          scm_clean: true
+          description: "awx-sub2api リポジトリ"
+        status_code: [200, 201]
+      when: _project_check.json.count == 0
+      register: _project_created
+
+    - name: Project ID 取得
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/projects/?name={{ awx_project_name | urlencode }}"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: _project
+
+    - name: Project ID をセット
+      ansible.builtin.set_fact:
+        _project_id: "{{ _project.json.results[0].id }}"
+
+    - name: Project 作成結果
+      ansible.builtin.debug:
+        msg: "Project '{{ awx_project_name }}' ID={{ _project_id }} ({{ '新規作成' if _project_check.json.count == 0 else '既存を使用' }})"
+
+    # Project の SCM 同期完了を待機（新規作成時のみ）
+    - name: Project SCM 同期の完了を待機
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/projects/{{ _project_id }}/"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: _project_status
+      until: _project_status.json.status in ['successful', 'failed', 'canceled']
+      retries: 30
+      delay: 10
+      when: _project_check.json.count == 0
+
+    - name: SCM 同期失敗チェック
+      ansible.builtin.fail:
+        msg: "Project の SCM 同期が失敗しました: {{ _project_status.json.status }}"
+      when:
+        - _project_check.json.count == 0
+        - _project_status.json.status != 'successful'
+
+    # ─────────────────────────────────────────
+    # 3. Machine Credential 作成
+    # ─────────────────────────────────────────
+    - name: Credential 存在確認
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/credentials/?name={{ awx_credential_name | urlencode }}"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: _cred_check
+
+    - name: Credential Type (Machine) ID 取得
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/credential_types/?name=Machine"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: _cred_type
+
+    - name: Machine Credential 作成
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/credentials/"
+        method: POST
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          name: "{{ awx_credential_name }}"
+          organization: "{{ _org_id }}"
+          credential_type: "{{ _cred_type.json.results[0].id }}"
+          inputs:
+            username: "opc"
+            ssh_key_data: "{{ awx_ssh_private_key_content }}"
+            become_method: "sudo"
+        status_code: [200, 201]
+      when: _cred_check.json.count == 0
+
+    - name: Credential ID 取得
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/credentials/?name={{ awx_credential_name | urlencode }}"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: _cred
+
+    - name: Credential ID をセット
+      ansible.builtin.set_fact:
+        _cred_id: "{{ _cred.json.results[0].id }}"
+
+    - name: Credential 作成結果
+      ansible.builtin.debug:
+        msg: "Credential '{{ awx_credential_name }}' ID={{ _cred_id }} ({{ '新規作成' if _cred_check.json.count == 0 else '既存を使用' }})"
+
+    # ─────────────────────────────────────────
+    # 4. Inventory 作成
+    # ─────────────────────────────────────────
+    - name: Inventory 存在確認
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/inventories/?name={{ awx_inventory_name | urlencode }}"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: _inv_check
+
+    - name: Inventory 作成
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/inventories/"
+        method: POST
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          name: "{{ awx_inventory_name }}"
+          organization: "{{ _org_id }}"
+          description: "sub2api 配布対象インベントリ"
+          variables: "{{ awx_inventory_variables }}"
+        status_code: [200, 201]
+      when: _inv_check.json.count == 0
+
+    - name: Inventory ID 取得
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/inventories/?name={{ awx_inventory_name | urlencode }}"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: _inv
+
+    - name: Inventory ID をセット
+      ansible.builtin.set_fact:
+        _inv_id: "{{ _inv.json.results[0].id }}"
+
+    - name: Inventory 作成結果
+      ansible.builtin.debug:
+        msg: "Inventory '{{ awx_inventory_name }}' ID={{ _inv_id }} ({{ '新規作成' if _inv_check.json.count == 0 else '既存を使用' }})"
+
+    - name: Inventory 変数を更新（既存含む）
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/inventories/{{ _inv_id }}/"
+        method: PATCH
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          variables: "{{ awx_inventory_variables }}"
+        status_code: [200]
+
+    # ─────────────────────────────────────────
+    # 5. グループ・ホスト登録
+    # ─────────────────────────────────────────
+    - name: グループ作成
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/groups/"
+        method: POST
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          name: "{{ item.name }}"
+          inventory: "{{ _inv_id }}"
+        status_code: [200, 201]
+      loop: "{{ awx_inventory_groups }}"
+      register: _groups_created
+      # 既存グループ (409) はスキップ
+      failed_when: >
+        _groups_created.status not in [200, 201] and
+        not (_groups_created.status == 400 and 'already exists' in (_groups_created.json.name | default(['']) | join('')))
+
+    - name: グループ ID 取得
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/groups/?inventory={{ _inv_id }}&name={{ item.name | urlencode }}"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      loop: "{{ awx_inventory_groups }}"
+      register: _group_ids
+
+    - name: ホスト作成・グループ追加
+      vars:
+        _group_id: "{{ (_group_ids.results | selectattr('item.name', 'equalto', item.0.name) | first).json.results[0].id }}"
+        _host_vars_yaml: "{{ item.1.vars | to_yaml }}"
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/hosts/"
+        method: POST
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          name: "{{ item.1.name }}"
+          inventory: "{{ _inv_id }}"
+          variables: "{{ _host_vars_yaml }}"
+        status_code: [200, 201]
+      loop: "{{ awx_inventory_groups | subelements('hosts') }}"
+      register: _hosts_result
+      # 既存ホストは無視
+      failed_when: >
+        _hosts_result.status not in [200, 201] and
+        not (_hosts_result.status == 400 and 'already exists' in (_hosts_result.json.name | default(['']) | join('')))
+
+    - name: ホスト ID 取得
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/hosts/?inventory={{ _inv_id }}&name={{ item.1.name | urlencode }}"
+        method: GET
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      loop: "{{ awx_inventory_groups | subelements('hosts') }}"
+      register: _host_ids
+
+    - name: ホストをグループに追加
+      vars:
+        _group_id: "{{ (_group_ids.results | selectattr('item.name', 'equalto', item.0.name) | first).json.results[0].id }}"
+        _host_id: "{{ (_host_ids.results | selectattr('item.1.name', 'equalto', item.1.name) | first).json.results[0].id }}"
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/groups/{{ _group_id }}/hosts/"
+        method: POST
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          id: "{{ _host_id }}"
+        status_code: [200, 201, 204]
+      loop: "{{ awx_inventory_groups | subelements('hosts') }}"
+
+    # ─────────────────────────────────────────
+    # 6. Job Template 作成
+    # ─────────────────────────────────────────
+    - name: Job Template 作成
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/job_templates/"
+        method: POST
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          name: "{{ item.name }}"
+          job_type: run
+          inventory: "{{ _inv_id }}"
+          project: "{{ _project_id }}"
+          playbook: "{{ item.playbook }}"
+          limit: "{{ item.limit }}"
+          become_enabled: true
+          description: "{{ item.description }}"
+        status_code: [200, 201]
+      loop: "{{ awx_job_templates }}"
+      register: _jt_result
+      failed_when: >
+        _jt_result.status not in [200, 201] and
+        not (_jt_result.status == 400 and 'already exists' in (_jt_result.json.name | default(['']) | join('')))
+
+    - name: Job Template に Credential を紐付け
+      vars:
+        _jt_id: "{{ item.json.id }}"
+      ansible.builtin.uri:
+        url: "{{ awx_api }}/job_templates/{{ _jt_id }}/credentials/"
+        method: POST
+        user: "{{ awx_username }}"
+        password: "{{ awx_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          id: "{{ _cred_id }}"
+        status_code: [200, 201, 204]
+      loop: "{{ _jt_result.results }}"
+      when: item.status in [200, 201]
+
+    # ─────────────────────────────────────────
+    # 完了サマリ
+    # ─────────────────────────────────────────
+    - name: セットアップ完了
+      ansible.builtin.debug:
+        msg:
+          - "=============================="
+          - "AWX リソースセットアップ完了"
+          - "=============================="
+          - "Project  : {{ awx_project_name }} (ID={{ _project_id }})"
+          - "Credential: {{ awx_credential_name }} (ID={{ _cred_id }})"
+          - "Inventory : {{ awx_inventory_name }} (ID={{ _inv_id }})"
+          - "Job Templates: build-awx-controller / deploy-sub2api"
+          - ""
+          - "次のステップ:"
+          - "  1. {{ awx_host }}/#/templates で Job Template を確認"
+          - "  2. 'build-awx-controller' を起動"
+          - "  3. 完了後、'deploy-sub2api' を起動"

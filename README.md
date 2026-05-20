@@ -19,35 +19,125 @@ AWX 向け Ansible 構成です。
 
 ### 構成
 
-- `deploy-awx.yml`: AWX コントローラーサーバー自体を Kubernetes 上に構築する playbook
+- `deploy-awx.yml`: AWX コントローラーサーバー自体を Kubernetes 上に構築する playbook（構築後にリソース自動セットアップあり）
 - `deploy-sub2api.yml`: AWX Job Template で実行するメイン playbook
-- `inventory/hosts.yml`: 初期 inventory の例
+- `setup-awx-resources.py`: AWX 構築後に Project / Credential / Inventory / Job Template を一括作成するスクリプト（`deploy-awx.yml` から自動実行）
+- `setup-awx-resources.yml`: 上記と同等のリソースを Ansible 経由で作成する playbook（代替手段）
+- `setup-awx-resources.sh`: `setup-awx-resources.yml` を実行するラッパースクリプト
+- `inventory/hosts.yml`: 運用 inventory（ローカル専用・`.gitignore` 対象）
+- `inventory/hosts.example.yml`: 配布用サンプル inventory
 - `roles/docker`: Docker Engine と Compose plugin を導入
 - `roles/awx_k8s`: `kubeadm` ベースの Kubernetes と AWX を導入
 - `roles/sub2api`: 配置ディレクトリを準備して `sub2api` を起動
 - `docs/AWX_K8S_SETUP.md`: 標準 Kubernetes 上で AWX を作る手順
 - `k8s/awx/`: AWX Operator と AWX CR のサンプル
 
-### AWX セットアップ
+### 前提条件
 
-1. まずローカル Ansible から `deploy-awx.yml` を実行して、`instance-20251213-ARM_fw` に AWX を作成します。
-2. AWX 作成後、このリポジトリを AWX の Project として登録します。
-3. Oracle Linux の `opc` 用 SSH 鍵で Machine Credential を作成します。
-4. AWX から各ホストへ到達できることを確認します。
-5. Inventory を作成し、`inventory/hosts.yml` を取り込むか、同じホストを AWX 側で定義します。
-6. Job Template を作成します。
-7. Playbook に `deploy-sub2api.yml` を指定します。
-8. Credential には上記 Machine Credential を指定します。
-9. Privilege escalation を有効にします。
+- ローカルに Ansible がインストールされていること
+- `instance-20251213-ARM_fw` (`140.83.58.183`) へ `opc` ユーザーで SSH できること
+- AWX に登録する **opc 用 SSH 秘密鍵**がローカルにあること（既定: `~/.ssh/id_rsa`）
+- `inventory/hosts.yml` が環境に合わせて用意されていること（未作成なら `inventory/hosts.example.yml` をコピーして編集）
 
-### AWXコントローラーサーバー構築
+### 実行手順（推奨）
 
-`deploy-awx.yml` は AWX コントローラーサーバー自体を Kubernetes 上に構築するための playbook です。
+#### 1. inventory を用意する
 
-### AWX Web UI からの実行手順
+```bash
+cp inventory/hosts.example.yml inventory/hosts.yml
+# ansible_host や ProxyJump を環境に合わせて編集
+```
+
+#### 2. SSH 秘密鍵パスを確認する
+
+`group_vars/all.yml` に既定値があります（Ansible を実行するマシン上のパス）。
+
+```yaml
+awx_ssh_private_key_file: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"
+```
+
+別の鍵を使う場合は、playbook 実行時に上書きします。
+
+```bash
+ansible-playbook -i inventory/hosts.yml deploy-awx.yml \
+  -e awx_ssh_private_key_file=~/.ssh/別の鍵
+```
+
+#### 3. AWX 構築 + リソース自動セットアップを実行する
+
+```bash
+cd awx-sub2api
+ANSIBLE_LOCAL_TEMP=/tmp/ansible-local \
+  ansible-playbook -i inventory/hosts.yml deploy-awx.yml
+```
+
+この playbook は次の 2 段階で動きます。
+
+| 段階 | 内容 |
+|------|------|
+| プレイ 1 | Kubernetes / AWX Operator / AWX 本体の構築（`roles/awx_k8s`） |
+| プレイ 2 | `setup-awx-resources.py` による Project・Credential・Inventory・Job Template の自動作成 |
+
+- プレイ 1 完了時に AWX の URL と admin パスワードが表示されます（Kubernetes Secret から取得）。
+- プレイ 2 ではローカルの SSH 秘密鍵を一時的に AWX ホストへコピーし、AWX API 経由で Machine Credential を登録した後、一時ファイルは削除されます。
+- AWX 本体の構築だけ行い、リソース登録を省略する場合:
+
+```bash
+ansible-playbook -i inventory/hosts.yml deploy-awx.yml -e awx_setup_resources=false
+```
+
+#### 4. AWX Web UI で sub2api を配布する
+
+1. ブラウザで [AWX Templates](http://140.83.58.183:30080/#/templates) を開く
+2. 初回構築直後は **`build-awx-controller`** が不要な場合があります（ローカル Ansible で既に構築済みのため）
+3. Job Template **`deploy-sub2api`** を起動し、各 `sub2api_targets` へ配布する
+
+#### 5. リソースセットアップだけやり直す場合
+
+AWX は起動済みで、Project / Credential / Inventory / Job Template の登録だけ再実行したいとき:
+
+```bash
+# 2 つ目のプレイから再開（AWX 構築をスキップ）
+ANSIBLE_LOCAL_TEMP=/tmp/ansible-local \
+  ansible-playbook -i inventory/hosts.yml deploy-awx.yml \
+  --start-at-task "AWX リソースセットアップをスキップするか確認"
+```
+
+または AWX ホスト上 / ローカルからスクリプトを直接実行:
+
+```bash
+# 管理者パスワードは kubectl で取得（AWX ホスト上）
+sudo KUBECONFIG=/etc/kubernetes/admin.conf \
+  kubectl -n awx get secret awx-admin-password -o jsonpath='{.data.password}' | base64 -d
+
+python3 setup-awx-resources.py ~/.ssh/id_rsa '<上記パスワード>'
+```
+
+### AWX 手動セットアップ（自動セットアップを使わない場合）
+
+自動セットアップ（`setup-awx-resources.py`）を使わない場合は、AWX Web UI から次を手動で行います。
+
+1. ローカル Ansible から `deploy-awx.yml -e awx_setup_resources=false` を実行し AWX を構築する
+2. このリポジトリを AWX の Project（Git SCM）として登録する
+3. Oracle Linux の `opc` 用 SSH 鍵で Machine Credential を作成する
+4. AWX から各ホストへ到達できることを確認する
+5. Inventory を作成し、`inventory/hosts.yml` と同じグループ・ホストを定義する
+6. Job Template `build-awx-controller` / `deploy-sub2api` を作成する
+7. `deploy-sub2api` に Machine Credential と privilege escalation（sudo）を設定する
+
+### AWX Web UI からの手動実行手順
 
 1. AWX コントローラーサーバーにこのリポジトリを配置します。
    - 例: `/home/opc/awx-sub2api` に `git clone` または `scp` で配置します。
+   - 例:
+     ```bash
+     ssh opc@140.83.58.183
+     cd /home/opc
+     rm -rf awx-sub2api
+     git clone https://github.com/zhuchuanhui/awx-sub2api.git
+     cd awx-sub2api
+     ```
+   - `awx-sub2api` が既に存在する場合は、`rm -rf awx-sub2api` で削除してから再クローンします。
    - AWX から参照できる Git リポジトリを作成するのが推奨です。
 2. AWX Web UI で Project を作成します。
    - SCM Type: `Git`
@@ -71,19 +161,47 @@ AWX 向け Ansible 構成です。
 
 ### 便利な変数
 
-必要に応じて、AWX の Inventory vars、Group vars、Host vars、または Survey で設定します。
+`group_vars/all.yml` および AWX の Inventory vars / Survey で利用できます。
 
 ```yaml
+# deploy-awx.yml プレイ 2（リソース自動セットアップ）
+awx_ssh_private_key_file: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"  # 既定。ローカル opc 用秘密鍵
+awx_setup_resources: true   # false で Project 等の自動作成をスキップ
+
+# deploy-sub2api.yml
 sub2api_deploy_dir: /home/opc/sub2api-deploy
 sub2api_env_overrides:
   TZ: Asia/Tokyo
 ```
 
-AWX 自体を Ansible で作成するコマンド例:
+### トラブルシューティング
 
-```bash
-ansible-playbook -i inventory/hosts.yml deploy-awx.yml
+| 症状 | 原因 | 対処 |
+|------|------|------|
+| `awx_ssh_private_key_file is defined` で失敗 | SSH 秘密鍵パス未設定・ファイル不存在 | `group_vars/all.yml` を確認するか `-e awx_ssh_private_key_file=~/.ssh/id_rsa` を指定 |
+| `setup-awx-resources.py` が Permission denied | 一時ファイルが root 所有 | `deploy-awx.yml` を最新版で再実行（`--start-at-task` でプレイ 2 から可） |
+| `kubectl ... admin.conf: permission denied` | プレイ 2 で `kubectl` に sudo が必要 | 最新の `deploy-awx.yml` を使用（admin パスワード取得タスクは `become: true`） |
+| プレイ 1 は成功、プレイ 2 のみ失敗 | AWX は起動済み | 上記「リソースセットアップだけやり直す」を参照 |
+| AWX UI に Job Template が無い | プレイ 2 未実行または失敗 | `awx_setup_resources=false` を付けていないか確認し、プレイ 2 を再実行 |
+| AWX Job で `Are you sure you want to continue connecting (yes/no)?` | AWX ランナーは `ansible.cfg` の `host_key_checking` を無視することがある | Project を SCM 同期後、Inventory 変数に `ansible_host_key_checking: false` を設定する（下記） |
+
+#### AWX Job で SSH ホスト鍵確認が止まる場合
+
+AWX から `deploy-sub2api` を実行するとき、ランナーは対話的な `yes/no` を受け付けません。
+Inventory **`sub2api-inventory`** の Variables に次を追加するか、`setup-awx-resources.py` を再実行して変数を更新してください。
+
+```yaml
+ansible_host_key_checking: false
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 ```
+
+`ProxyJump` 利用ホスト（`amd-instance-internal*`）はホスト変数で両方を指定します。
+
+```yaml
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyJump=opc@140.83.58.183"
+```
+
+リポジトリ最新版の `deploy-sub2api.yml` にも playbook 側の既定値があります。AWX Project の **SCM 同期**後に Job を再実行してください。
 
 ### 補足
 
@@ -113,6 +231,8 @@ ansible-playbook -i inventory/hosts.yml deploy-awx.yml
 
 - `deploy-awx.yml`: AWX コントローラー配布用 playbook
 - `deploy-sub2api.yml`: AWX Job Template 実行用 playbook
+- `setup-awx-resources.py`: AWX リソース自動セットアップスクリプト
+- `group_vars/all.yml`: 共通変数（`awx_ssh_private_key_file` など）
 - `docs/AWX_K8S_SETUP.md`: AWX/Kubernetes セットアップガイド
 - `k8s/awx/`: AWX Operator サンプルマニフェスト
 - `roles/`: Docker / AWX/K8s / sub2api 配布用 Ansible role
@@ -136,34 +256,111 @@ This repository contains an AWX-friendly Ansible layout for deploying
 
 ### Layout
 
-- `deploy-awx.yml`: playbook for building the AWX controller server itself on Kubernetes
+- `deploy-awx.yml`: builds the AWX controller on Kubernetes and optionally runs automated resource setup
 - `deploy-sub2api.yml`: main playbook for the AWX Job Template
-- `inventory/hosts.yml`: example inventory
+- `setup-awx-resources.py`: creates Project / Credential / Inventory / Job Templates via AWX API (invoked from `deploy-awx.yml`)
+- `setup-awx-resources.yml`: Ansible-based alternative for the same resources
+- `setup-awx-resources.sh`: wrapper for `setup-awx-resources.yml`
+- `inventory/hosts.yml`: local inventory (gitignored)
+- `inventory/hosts.example.yml`: sanitized sample inventory for distribution
 - `roles/docker`: installs Docker Engine and the Compose plugin
 - `roles/awx_k8s`: installs `kubeadm`-based Kubernetes and AWX
 - `roles/sub2api`: prepares the deployment directory and starts `sub2api`
 - `docs/AWX_K8S_SETUP.md`: setup guide for running AWX on standard Kubernetes
 - `k8s/awx/`: sample AWX Operator and AWX custom resource manifests
 
-### AWX setup
+### Prerequisites
 
-1. First, run `deploy-awx.yml` from local Ansible to create AWX on `instance-20251213-ARM_fw`.
-2. After AWX is up, register this repository as an AWX Project.
-3. Create a Machine Credential using the Oracle Linux `opc` SSH key.
-4. Confirm that AWX can reach each target host.
-5. Create an Inventory and either import `inventory/hosts.yml` or define the same hosts directly in AWX.
-6. Create a Job Template.
-7. Set the playbook to `deploy-sub2api.yml`.
-8. Attach the Machine Credential above.
-9. Enable privilege escalation.
+- Ansible installed on your workstation
+- SSH access to `instance-20251213-ARM_fw` (`140.83.58.183`) as `opc`
+- Local `opc` SSH private key (default: `~/.ssh/id_rsa`)
+- `inventory/hosts.yml` prepared for your environment (copy from `inventory/hosts.example.yml`)
 
-### Deploy from AWX controller
+### Recommended procedure
 
-The `deploy-awx.yml` playbook builds the AWX controller server itself on Kubernetes from the AWX controller host.
+#### 1. Prepare inventory
 
-### Run from AWX Web UI
+```bash
+cp inventory/hosts.example.yml inventory/hosts.yml
+# Edit ansible_host and ProxyJump for your environment
+```
+
+#### 2. Confirm SSH private key path
+
+Default in `group_vars/all.yml` (path on the machine that runs Ansible):
+
+```yaml
+awx_ssh_private_key_file: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"
+```
+
+Override at runtime if needed:
+
+```bash
+ansible-playbook -i inventory/hosts.yml deploy-awx.yml \
+  -e awx_ssh_private_key_file=~/.ssh/other_key
+```
+
+#### 3. Build AWX and auto-configure resources
+
+```bash
+cd awx-sub2api
+ANSIBLE_LOCAL_TEMP=/tmp/ansible-local \
+  ansible-playbook -i inventory/hosts.yml deploy-awx.yml
+```
+
+| Play | Purpose |
+|------|---------|
+| Play 1 | Kubernetes + AWX Operator + AWX (`roles/awx_k8s`) |
+| Play 2 | Project / Credential / Inventory / Job Templates via `setup-awx-resources.py` |
+
+- Play 1 prints the AWX URL and admin password from the Kubernetes secret.
+- Play 2 copies your local SSH key temporarily, registers the Machine Credential, then deletes temp files.
+- AWX only, skip resource setup: `-e awx_setup_resources=false`
+
+#### 4. Deploy sub2api from AWX UI
+
+1. Open [AWX Templates](http://140.83.58.183:30080/#/templates)
+2. Skip `build-awx-controller` if AWX was already built by local Ansible
+3. Launch **`deploy-sub2api`** to deploy to `sub2api_targets`
+
+#### 5. Re-run resource setup only
+
+```bash
+ANSIBLE_LOCAL_TEMP=/tmp/ansible-local \
+  ansible-playbook -i inventory/hosts.yml deploy-awx.yml \
+  --start-at-task "AWX リソースセットアップをスキップするか確認"
+```
+
+Or run the script directly:
+
+```bash
+python3 setup-awx-resources.py ~/.ssh/id_rsa '<AWX_ADMIN_PASSWORD>'
+```
+
+### Manual AWX setup (without automation)
+
+If you do not use `setup-awx-resources.py`, configure AWX in the Web UI after `deploy-awx.yml -e awx_setup_resources=false`:
+
+1. Build AWX with local Ansible
+2. Register this repo as a Git Project
+3. Create Machine Credential with the `opc` SSH key
+4. Verify connectivity to all targets
+5. Create Inventory matching `inventory/hosts.yml`
+6. Create Job Templates `build-awx-controller` and `deploy-sub2api`
+7. Enable sudo on `deploy-sub2api`
+
+### Manual setup from AWX Web UI
 
 1. Place this repository on the AWX controller host or make it accessible via Git.
+   - Example:
+     ```bash
+     ssh opc@140.83.58.183
+     cd /home/opc
+     rm -rf awx-sub2api
+     git clone https://github.com/zhuchuanhui/awx-sub2api.git
+     cd awx-sub2api
+     ```
+   - If `awx-sub2api` already exists, remove it first with `rm -rf awx-sub2api` before cloning again.
 2. Create an AWX Project:
    - SCM Type: `Git`
    - SCM URL: your repository URL
@@ -184,19 +381,26 @@ The `deploy-awx.yml` playbook builds the AWX controller server itself on Kuberne
 
 ### Useful variables
 
-Set these in AWX Inventory vars, Group vars, Host vars, or Survey as needed.
+Defined in `group_vars/all.yml` and overridable in AWX Inventory / Survey.
 
 ```yaml
+awx_ssh_private_key_file: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"
+awx_setup_resources: true
 sub2api_deploy_dir: /home/opc/sub2api-deploy
 sub2api_env_overrides:
   TZ: Asia/Tokyo
 ```
 
-Example command for deploying AWX itself with Ansible:
+### Troubleshooting
 
-```bash
-ansible-playbook -i inventory/hosts.yml deploy-awx.yml
-```
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `awx_ssh_private_key_file` assert fails | Missing or wrong key path | Check `group_vars/all.yml` or pass `-e awx_ssh_private_key_file=~/.ssh/id_rsa` |
+| `setup-awx-resources.py` Permission denied | Temp files owned by root | Re-run play 2 with latest `deploy-awx.yml` |
+| `kubectl ... admin.conf: permission denied` | kubectl needs sudo on play 2 | Use latest `deploy-awx.yml` |
+| Play 1 OK, play 2 failed | AWX already up | Re-run from play 2 only (see above) |
+| No Job Templates in AWX UI | Play 2 skipped or failed | Ensure `awx_setup_resources` is not `false`; re-run play 2 |
+| AWX Job stuck on SSH `yes/no` host key prompt | AWX runner may ignore project `ansible.cfg` | Set `ansible_host_key_checking: false` on inventory `sub2api-inventory`, sync SCM, re-run job (see Japanese section) |
 
 ### Notes
 
@@ -226,6 +430,8 @@ This produces a tarball containing the playbooks, role code, docs, sample invent
 
 - `deploy-awx.yml`: AWX controller deployment playbook
 - `deploy-sub2api.yml`: AWX Job Template playbook
+- `setup-awx-resources.py`: automated AWX resource setup script
+- `group_vars/all.yml`: shared variables including `awx_ssh_private_key_file`
 - `docs/AWX_K8S_SETUP.md`: AWX/Kubernetes setup guide
 - `k8s/awx/`: sample AWX Operator manifests
 - `roles/`: Ansible roles for Docker, AWX/K8s, and sub2api deployment
@@ -249,34 +455,103 @@ This produces a tarball containing the playbooks, role code, docs, sample invent
 
 ### 目录结构
 
-- `deploy-awx.yml`: 用于从 AWX 控制器服务器向 Kubernetes 部署 AWX 的 playbook
+- `deploy-awx.yml`: 在 Kubernetes 上构建 AWX，并可自动完成资源配置
 - `deploy-sub2api.yml`: AWX Job Template 使用的主 playbook
-- `inventory/hosts.yml`: 初始 inventory 示例
+- `setup-awx-resources.py`: 通过 AWX API 一键创建资源（由 `deploy-awx.yml` 调用）
+- `setup-awx-resources.yml`: 用 Ansible 创建相同资源的替代 playbook
+- `setup-awx-resources.sh`: `setup-awx-resources.yml` 的包装脚本
+- `inventory/hosts.yml`: 本地 inventory（已 gitignore）
+- `inventory/hosts.example.yml`: 分发用示例 inventory
 - `roles/docker`: 安装 Docker Engine 和 Compose 插件
 - `roles/awx_k8s`: 安装基于 `kubeadm` 的 Kubernetes 与 AWX
 - `roles/sub2api`: 准备部署目录并启动 `sub2api`
 - `docs/AWX_K8S_SETUP.md`: 在标准 Kubernetes 上部署 AWX 的步骤说明
 - `k8s/awx/`: AWX Operator 与 AWX 自定义资源示例
 
-### AWX 设置步骤
+### 前提条件
 
-1. 先从本地 Ansible 执行 `deploy-awx.yml`，在 `instance-20251213-ARM_fw` 上创建 AWX。
-2. AWX 启动后，将此仓库注册为 AWX 的 Project。
-3. 使用 Oracle Linux 的 `opc` SSH 密钥创建 Machine Credential。
-4. 确认 AWX 可以连接到每一台目标主机。
-5. 创建 Inventory，并导入 `inventory/hosts.yml`，或者在 AWX 中手动定义相同主机。
-6. 创建 Job Template。
-7. Playbook 选择 `deploy-sub2api.yml`。
-8. 绑定上面的 Machine Credential。
-9. 启用 privilege escalation。
+- 本地已安装 Ansible
+- 能以 `opc` 用户 SSH 到 `instance-20251213-ARM_fw` (`140.83.58.183`)
+- 本地有 **opc 用 SSH 私钥**（默认 `~/.ssh/id_rsa`）
+- 已准备 `inventory/hosts.yml`（可从 `inventory/hosts.example.yml` 复制）
 
-### 从 AWX 控制器部署
+### 推荐执行步骤
 
-`deploy-awx.yml` playbook 用于从 AWX 控制器服务器向 Kubernetes 构建 AWX 控制器服务器本身。
+#### 1. 准备 inventory
 
-### 从 AWX Web UI 执行
+```bash
+cp inventory/hosts.example.yml inventory/hosts.yml
+# 按环境修改 ansible_host 和 ProxyJump
+```
+
+#### 2. 确认 SSH 私钥路径
+
+`group_vars/all.yml` 中的默认值（Ansible 执行机器上的路径）：
+
+```yaml
+awx_ssh_private_key_file: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"
+```
+
+需要其他密钥时在命令行覆盖：
+
+```bash
+ansible-playbook -i inventory/hosts.yml deploy-awx.yml \
+  -e awx_ssh_private_key_file=~/.ssh/其他密钥
+```
+
+#### 3. 构建 AWX 并自动配置资源
+
+```bash
+cd awx-sub2api
+ANSIBLE_LOCAL_TEMP=/tmp/ansible-local \
+  ansible-playbook -i inventory/hosts.yml deploy-awx.yml
+```
+
+| 阶段 | 内容 |
+|------|------|
+| Play 1 | Kubernetes / AWX Operator / AWX 本体（`roles/awx_k8s`） |
+| Play 2 | `setup-awx-resources.py` 创建 Project / Credential / Inventory / Job Template |
+
+- Play 1 结束时会显示 AWX URL 和 admin 密码。
+- Play 2 会临时复制本地 SSH 私钥、注册 Machine Credential 后删除临时文件。
+- 仅构建 AWX、跳过资源注册：`-e awx_setup_resources=false`
+
+#### 4. 在 AWX UI 中部署 sub2api
+
+1. 打开 [AWX Templates](http://140.83.58.183:30080/#/templates)
+2. 若本地 Ansible 已构建 AWX，可跳过 `build-awx-controller`
+3. 启动 **`deploy-sub2api`** 部署到各 `sub2api_targets`
+
+#### 5. 仅重新执行资源配置
+
+```bash
+ANSIBLE_LOCAL_TEMP=/tmp/ansible-local \
+  ansible-playbook -i inventory/hosts.yml deploy-awx.yml \
+  --start-at-task "AWX リソースセットアップをスキップするか確認"
+```
+
+或直接运行脚本：
+
+```bash
+python3 setup-awx-resources.py ~/.ssh/id_rsa '<AWX管理员密码>'
+```
+
+### 手动 AWX 配置（不使用自动脚本）
+
+使用 `deploy-awx.yml -e awx_setup_resources=false` 构建 AWX 后，在 Web UI 中手动完成：Project、Machine Credential、Inventory、Job Template 等（步骤同日文「手動セットアップ」）。
+
+### 从 AWX Web UI 手动执行
 
 1. 将此仓库放置到 AWX 控制器服务器，或通过 Git 使其可被访问。
+   - 示例：
+     ```bash
+     ssh opc@140.83.58.183
+     cd /home/opc
+     rm -rf awx-sub2api
+     git clone https://github.com/zhuchuanhui/awx-sub2api.git
+     cd awx-sub2api
+     ```
+   - 如果 `awx-sub2api` 已经存在，请先使用 `rm -rf awx-sub2api` 删除，然后再重新克隆。
 2. 在 AWX Web UI 中创建 Project：
    - SCM Type: `Git`
    - SCM URL: 你的仓库 URL
@@ -297,19 +572,26 @@ This produces a tarball containing the playbooks, role code, docs, sample invent
 
 ### 常用变量
 
-可根据需要在 AWX 的 Inventory vars、Group vars、Host vars 或 Survey 中设置。
+见 `group_vars/all.yml`，可在 AWX Inventory / Survey 中覆盖。
 
 ```yaml
+awx_ssh_private_key_file: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"
+awx_setup_resources: true
 sub2api_deploy_dir: /home/opc/sub2api-deploy
 sub2api_env_overrides:
   TZ: Asia/Tokyo
 ```
 
-使用 Ansible 部署 AWX 本体的示例命令:
+### 故障排除
 
-```bash
-ansible-playbook -i inventory/hosts.yml deploy-awx.yml
-```
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| `awx_ssh_private_key_file` 断言失败 | 未设置或密钥文件不存在 | 检查 `group_vars/all.yml` 或 `-e awx_ssh_private_key_file=~/.ssh/id_rsa` |
+| `setup-awx-resources.py` Permission denied | 临时文件属主为 root | 用最新 `deploy-awx.yml` 重跑 Play 2 |
+| `kubectl ... admin.conf: permission denied` | Play 2 中 kubectl 需要 sudo | 使用最新 `deploy-awx.yml` |
+| Play 1 成功、Play 2 失败 | AWX 已运行 | 仅重跑 Play 2（见上文） |
+| AWX UI 无 Job Template | Play 2 未执行或失败 | 确认未设置 `awx_setup_resources=false`，重跑 Play 2 |
+| AWX Job 停在 SSH `yes/no` 提示 | AWX 运行器可能不读取项目 `ansible.cfg` | 在 Inventory 设置 `ansible_host_key_checking: false`，同步 SCM 后重跑（见日文说明） |
 
 ### 说明
 
@@ -339,6 +621,8 @@ ansible-playbook -i inventory/hosts.yml deploy-awx.yml
 
 - `deploy-awx.yml`: AWX 控制器部署 playbook
 - `deploy-sub2api.yml`: AWX Job Template playbook
+- `setup-awx-resources.py`: AWX 资源自动配置脚本
+- `group_vars/all.yml`: 公共变量（含 `awx_ssh_private_key_file`）
 - `docs/AWX_K8S_SETUP.md`: AWX/Kubernetes 设置指南
 - `k8s/awx/`: AWX Operator 示例清单
 - `roles/`: Docker、AWX/K8s 和 sub2api 部署的 Ansible role
