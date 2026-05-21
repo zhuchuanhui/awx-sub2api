@@ -68,6 +68,13 @@ JOB_TEMPLATES = [
         "limit": "sub2api_targets",
         "description": "sub2api を対象ホストに配布・起動する",
     },
+    {
+        "name": "deploy-k8s",
+        "playbook": "deploy-k8s.yml",
+        "limit": "",
+        "description": "Kubernetes (kubeadm/Calico) のみを対象ホストに配布する",
+        "ask_variables_on_launch": True,
+    },
 ]
 
 # Inventory レベルの共通変数。
@@ -296,7 +303,7 @@ def main():
             print(f"  ✓ '{jt_def['name']}' は既存 (ID={jt['id']})")
             jt_id = jt["id"]
         else:
-            jt = client.post("/job_templates/", {
+            jt_body = {
                 "name": jt_def["name"],
                 "job_type": "run",
                 "inventory": inv_id,
@@ -305,7 +312,10 @@ def main():
                 "limit": jt_def["limit"],
                 "become_enabled": True,
                 "description": jt_def["description"],
-            })
+            }
+            if jt_def.get("ask_variables_on_launch"):
+                jt_body["ask_variables_on_launch"] = True
+            jt = client.post("/job_templates/", jt_body)
             jt_id = jt["id"]
             print(f"  ✨ '{jt_def['name']}' を作成 (ID={jt_id})")
 
