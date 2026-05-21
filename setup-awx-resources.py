@@ -321,6 +321,26 @@ def main():
 
         # Credential を紐付け
         client._req("POST", f"/job_templates/{jt_id}/credentials/", {"id": cred_id})
+
+        # Survey Spec を追加 (deploy-k8s 用)
+        if jt_def["name"] == "deploy-k8s":
+            survey_body = {
+                "name": "Target Host Configuration",
+                "description": "Specify target hosts or groups.",
+                "spec": [
+                    {
+                        "question_name": "配布先ホストまたはグループ名",
+                        "question_description": "Kubernetes をデプロイする対象グループ名（例: sub2api_targets, awx_controller）または個別のホスト名を入力してください。",
+                        "variable": "target_hosts",
+                        "type": "text",
+                        "default": "sub2api_targets",
+                        "required": True
+                    }
+                ]
+            }
+            client._req("POST", f"/job_templates/{jt_id}/survey_spec/", survey_body)
+            client._req("PATCH", f"/job_templates/{jt_id}/", {"survey_enabled": True})
+            print(f"    ✓ '{jt_def['name']}' の Survey (サーベイ) を設定しました")
     print()
 
     # 完了
