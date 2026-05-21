@@ -152,10 +152,11 @@ python3 setup-awx-resources.py ~/.ssh/id_rsa '<上記パスワード>'
 4. Inventory を作成し、`inventory/hosts.yml` を取り込むか、AWX 上で同じホストとグループを定義します。
    - `awx_controller` グループには `instance-20251213-ARM_fw` を登録
    - `sub2api_targets` グループには対象ホストを登録
-5. Job Template を 3 つ作成します。
-   - `build-awx-controller`: Project = `awx-sub2api`, Playbook = `deploy-awx.yml`, Inventory = `awx_controller`, Credential = Machine, Privilege Escalation 有効
+5. Job Template を 4 つ作成します。
+   - `build-awx-controller`: Project = `awx-sub2api`, Playbook = `deploy-awx.yml`, Inventory = `awx_controller`, Credential = Machine, Privilege Escalation 有効, Variables の `Prompt on Launch` 有効 (ホスト選択可能)
    - `deploy-sub2api`: Project = `awx-sub2api`, Playbook = `deploy-sub2api.yml`, Inventory = `sub2api_targets`, Credential = Machine, Privilege Escalation 有効
    - `deploy-k8s`: Project = `awx-sub2api`, Playbook = `deploy-k8s.yml`, Inventory = 対象インベントリ, Credential = Machine, Privilege Escalation 有効, Variables の `Prompt on Launch` 有効
+   - `run-any-playbook`: Project = `awx-sub2api`, Playbook = `{{ selected_playbook }}`, Inventory = 対象インベントリ, Credential = Machine, Privilege Escalation 有効, Variables の `Prompt on Launch` 有効 (Playbook とホストを実行時に選択)
 6. まず `build-awx-controller` を実行し、AWX コントローラーを構築します。その後、必要に応じて `deploy-sub2api` または `deploy-k8s` を実行します。
 
 #### 役割の対応
@@ -361,22 +362,30 @@ ANSIBLE_LOCAL_TEMP=/tmp/ansible-local \
 2. Skip `build-awx-controller` if AWX was already built by local Ansible
 3. Launch **`deploy-sub2api`** to deploy to `sub2api_targets`
 
-#### 5. Re-run resource setup only
+#### 5. Re-running Setup / Updating Templates (Two Methods)
 
-When AWX is already running and you want to re-run configuration only, or automatically register the newly added `deploy-k8s` job template:
+If AWX is already running and you want to register or update configuration details (like adding the new `deploy-k8s` template or Survey specifications), you can do so using one of the **two patterns** below. Existing resources are skipped (not overwritten) so both methods are completely safe to re-run.
 
-Running the updated script will automatically create the `deploy-k8s` template and enable the **"Prompt on Launch"** setting for variables. Any existing templates, projects, or inventories are skipped (not overwritten), making it safe to re-run.
+##### Pattern A: Direct Script Run (Recommended, Fast)
+Pushes settings directly via the AWX API without touching the server stack. Takes only **a few seconds** to complete.
+
+1. Fetch the admin password on the AWX controller host (skip if you already know the password):
+   ```bash
+   sudo KUBECONFIG=/etc/kubernetes/admin.conf \
+     kubectl -n awx get secret awx-admin-password -o jsonpath='{.data.password}' | base64 -d
+   ```
+2. Run the script directly with the credentials:
+   ```bash
+   python3 setup-awx-resources.py ~/.ssh/id_rsa '<PASSWORD>'
+   ```
+
+##### Pattern B: Ansible Playbook Run (Partial Execution)
+Starts the deployment playbook from the second play (resource configuration phase) using Ansible.
 
 ```bash
 ANSIBLE_LOCAL_TEMP=/tmp/ansible-local \
   ansible-playbook -i inventory/hosts.yml deploy-awx.yml \
   --start-at-task "AWX リソースセットアップをスキップするか確認"
-```
-
-Or run the script directly:
-
-```bash
-python3 setup-awx-resources.py ~/.ssh/id_rsa '<AWX_ADMIN_PASSWORD>'
 ```
 
 ### Manual AWX setup (without automation)
@@ -599,22 +608,30 @@ ANSIBLE_LOCAL_TEMP=/tmp/ansible-local \
 2. 若本地 Ansible 已构建 AWX，可跳过 `build-awx-controller`
 3. 启动 **`deploy-sub2api`** 部署到各 `sub2api_targets`
 
-#### 5. 仅重新执行资源配置
+#### 5. 重新配置或更新模板配置（两种方式）
 
-当 AWX 已经运行，您只想重新执行配置，或者想自动注册新添加的 `deploy-k8s` 作业模板时：
+如果 AWX 已经运行，您只想注册或更新配置内容（例如添加新的 `deploy-k8s` 模板或 Survey 问卷配置），可以使用以下 **两种模式** 之一进行操作。由于已存在的项目和清单将被跳过（不会被覆盖），因此这两种方法都是安全的。
 
-运行更新后的脚本将自动创建 `deploy-k8s` 模板，并为变量启用 **“启动时提示（Prompt on Launch）”** 设置。任何已存在的模板、项目或清单都将被跳过（不会被覆盖），因此可以安全地重新运行。
+##### 模式 A：直接执行配置脚本（推荐，快速）
+无需重新部署 AWX 服务器，直接通过 API 导入配置信息。只需 **数秒** 即可完成。
+
+1. 在 AWX 控制器主机上获取管理员密码（若在本地执行且已知密码可跳过此步）：
+   ```bash
+   sudo KUBECONFIG=/etc/kubernetes/admin.conf \
+     kubectl -n awx get secret awx-admin-password -o jsonpath='{.data.password}' | base64 -d
+   ```
+2. 使用凭据直接运行脚本：
+   ```bash
+   python3 setup-awx-resources.py ~/.ssh/id_rsa '<管理员密码>'
+   ```
+
+##### 模式 B：运行 Ansible Playbook（部分执行）
+使用 Ansible 并通过指定任务从第二个 Play（资源配置阶段）开始运行部署 playbook。
 
 ```bash
 ANSIBLE_LOCAL_TEMP=/tmp/ansible-local \
   ansible-playbook -i inventory/hosts.yml deploy-awx.yml \
   --start-at-task "AWX リソースセットアップをスキップするか確認"
-```
-
-或直接运行脚本：
-
-```bash
-python3 setup-awx-resources.py ~/.ssh/id_rsa '<AWX管理员密码>'
 ```
 
 ### 手动 AWX 配置（不使用自动脚本）
