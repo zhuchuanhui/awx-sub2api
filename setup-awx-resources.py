@@ -61,12 +61,32 @@ JOB_TEMPLATES = [
         "playbook": "deploy-awx.yml",
         "limit": "awx_controller",
         "description": "AWX コントローラーサーバーを Kubernetes 上に構築する",
+        "ask_variables_on_launch": True,
+        "variables": [
+            {
+                "key": "target_hosts",
+                "type": "string",
+                "description": "実行対象ホストまたはグループ名",
+                "prompt_on_launch": True,
+                "default": "awx_controller"
+            }
+        ]
     },
     {
         "name": "deploy-sub2api",
         "playbook": "deploy-sub2api.yml",
         "limit": "sub2api_targets",
         "description": "sub2api を対象ホストに配布・起動する",
+        "ask_variables_on_launch": True,
+        "variables": [
+            {
+                "key": "target_hosts",
+                "type": "string",
+                "description": "実行対象ホストまたはグループ名",
+                "prompt_on_launch": True,
+                "default": "sub2api_targets"
+            }
+        ]
     },
     {
         "name": "deploy-k8s",
@@ -74,6 +94,39 @@ JOB_TEMPLATES = [
         "limit": "",
         "description": "Kubernetes (kubeadm/Calico) のみを対象ホストに配布する",
         "ask_variables_on_launch": True,
+        "variables": [
+            {
+                "key": "target_hosts",
+                "type": "string",
+                "description": "実行対象ホストまたはグループ名",
+                "prompt_on_launch": True,
+                "default": "sub2api_targets"
+            }
+        ]
+    },
+    {
+        "name": "run-any-playbook",
+        "playbook": "run-any-playbook.yml",
+        "limit": "",
+        "description": "任意の Playbook を選択して実行",
+        "ask_variables_on_launch": True,
+        "variables": [
+            {
+                "key": "target_hosts",
+                "type": "string",
+                "description": "実行対象ホストまたはグループ名",
+                "prompt_on_launch": True,
+                "default": "sub2api_targets"
+            },
+            {
+                "key": "selected_playbook",
+                "type": "choice",
+                "description": "実行したい Playbook を選択",
+                "choices": ["deploy-awx.yml", "deploy-sub2api.yml", "deploy-k8s.yml"],
+                "default": "deploy-awx.yml",
+                "prompt_on_launch": True
+            }
+        ]
     },
 ]
 
@@ -337,6 +390,35 @@ def main():
                         "required": True
                     }
                 ]
+            }
+            client._req("POST", f"/job_templates/{jt_id}/survey_spec/", survey_body)
+            client._req("PATCH", f"/job_templates/{jt_id}/", {"survey_enabled": True})
+            print(f"    ✓ '{jt_def['name']}' の Survey (サーベイ) を設定しました")
+
+        # Survey Spec を追加 (run-any-playbook 用)
+        if jt_def["name"] == "run-any-playbook":
+            survey_body = {
+                "name": "Run Any Playbook",
+                "description": "Select target hosts and playbook to run",
+                "spec": [
+                    {
+                        "question_name": "配布先ホストまたはグループ名",
+                        "question_description": "ターゲットホストまたはグループを指定",
+                        "variable": "target_hosts",
+                        "type": "text",
+                        "default": "sub2api_targets",
+                        "required": True,
+                    },
+                    {
+                        "question_name": "実行したい Playbook",
+                        "question_description": "選択した Playbook を実行します",
+                        "variable": "selected_playbook",
+                        "type": "multiplechoice",
+                        "choices": ["deploy-awx.yml", "deploy-sub2api.yml", "deploy-k8s.yml"],
+                        "default": "deploy-awx.yml",
+                        "required": True,
+                    },
+                ],
             }
             client._req("POST", f"/job_templates/{jt_id}/survey_spec/", survey_body)
             client._req("PATCH", f"/job_templates/{jt_id}/", {"survey_enabled": True})

@@ -1,0 +1,60 @@
+# check-hosts.yml
+---
+- name: ホスト正常性確認プレイブック
+  hosts: all
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Ping モジュールで接続確認
+      ansible.builtin.ping:
+
+    - name: Pythonインタプリタ確認
+      ansible.builtin.command: "{{ ansible_python_interpreter | default('python3') }} --version"
+      register: py_version
+      ignore_errors: true
+    - name: Pythonバージョン表示
+      ansible.builtin.debug:
+        var: py_version.stdout
+
+    - name: Docker デーモン起動確認
+      ansible.builtin.command: systemctl is-active docker
+      register: docker_status
+      ignore_errors: true
+    - name: Docker 状態表示
+      ansible.builtin.debug:
+        msg: "Docker status: {{ docker_status.stdout }}"
+
+    - name: kubeadm バージョン確認
+      ansible.builtin.command: kubeadm version -o short
+      register: kubeadm_version
+      ignore_errors: true
+    - name: kubeadm バージョン表示
+      ansible.builtin.debug:
+        var: kubeadm_version.stdout
+
+    - name: kubectl バージョン確認
+      ansible.builtin.command: kubectl version --client --short
+      register: kubectl_version
+      ignore_errors: true
+    - name: kubectl バージョン表示
+      ansible.builtin.debug:
+        var: kubectl_version.stdout
+
+    - name: Calico pod 状態確認 (Kubernetes が起動している場合)
+      ansible.builtin.command: "kubectl get pods -n kube-system -l k8s-app=calico-node -o jsonpath='{.items[*].status.phase}'"
+      register: calico_status
+      ignore_errors: true
+    - name: Calico 状態表示
+      ansible.builtin.debug:
+        msg: "Calico pods status: {{ calico_status.stdout }}"
+
+    - name: sub2api コンテナ起動確認 (Docker Compose が使用されている場合)
+      ansible.builtin.command: "docker compose ps --format '{{{{.Service}}}} {{{{.State}}}}'"
+      args:
+        chdir: /home/opc/sub2api-deploy
+      register: sub2api_ps
+      ignore_errors: true
+    - name: sub2api コンテナ状態表示
+      ansible.builtin.debug:
+        msg: "sub2api compose status: {{ sub2api_ps.stdout }}"
