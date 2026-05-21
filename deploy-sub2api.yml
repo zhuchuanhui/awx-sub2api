@@ -24,6 +24,15 @@
       failed_when: false
       changed_when: false
 
+    - name: Create swapfile to prevent OOM
+      ansible.builtin.shell: |
+        fallocate -l 2G /swapfile
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+      args:
+        creates: /swapfile
+
     - name: Clean dnf cache to save memory
       ansible.builtin.raw: dnf clean all
       when: _python311_check.rc != 0
