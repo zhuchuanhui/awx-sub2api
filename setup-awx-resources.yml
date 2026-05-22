@@ -26,7 +26,7 @@
     awx_host: "http://140.83.58.183:30080"
     awx_username: "admin"
     awx_org: "Default"
-    awx_scm_url: "https://github.com/zhuchuanhui/awx-sub2api.git"
+    awx_scm_url: "https://github.com/zhuchuanhui/awx-k8s-sub2api.git"
     awx_scm_branch: "main"
     awx_project_name: "awx-sub2api"
     awx_credential_name: "opc-machine-credential"
