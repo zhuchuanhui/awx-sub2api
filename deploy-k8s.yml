@@ -7,6 +7,7 @@
     ansible_host_key_checking: false
     ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
     awx_k8s_install_awx: false  # k8sのみの構築にするためAWXインストールは無効化
+    ansible_python_interpreter: "{{ '/usr/bin/python3.11' if (_python311_installed | default(false) | bool) else (_system_python | default('/usr/bin/python3')) }}"
 
   pre_tasks:
     - name: Detect system python interpreter
@@ -33,9 +34,9 @@
       ansible.builtin.raw: dnf install -y python3.11 --setopt=tsflags=nodocs
       when: _python311_check.rc != 0
 
-    - name: Set python3.11 as interpreter
+    - name: Set python3.11 installed fact
       ansible.builtin.set_fact:
-        ansible_python_interpreter: /usr/bin/python3.11
+        _python311_installed: true
 
     - name: Gather facts manually with python3.11
       ansible.builtin.setup:
